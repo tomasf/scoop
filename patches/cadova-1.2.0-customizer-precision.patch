@@ -1,0 +1,116 @@
+diff --git a/Plugins/GenerateCustomizer/Template/meshes.js b/Plugins/GenerateCustomizer/Template/meshes.js
+index a52c8bdf..ff099108 100644
+--- a/Plugins/GenerateCustomizer/Template/meshes.js
++++ b/Plugins/GenerateCustomizer/Template/meshes.js
+@@ -31,7 +31,9 @@ export function createPartMeshes(positions, indices, faceMaterials, semantic) {
+         indicesByMaterial.get(material).push(indices[face * 3], indices[face * 3 + 1], indices[face * 3 + 2]);
+     }
+ 
+-    const position = new THREE.BufferAttribute(positions, 3);
++    // Preserve full precision for createSharpEdges; WebGL vertex attributes use f32.
++    const gpuPositions = positions instanceof Float32Array ? positions : new Float32Array(positions);
++    const position = new THREE.BufferAttribute(gpuPositions, 3);
+     const meshes = [...indicesByMaterial].map(([material, materialIndices]) => {
+         const geometry = new THREE.BufferGeometry();
+         geometry.setAttribute("position", position);
+diff --git a/Plugins/GenerateCustomizer/Template/preview.js b/Plugins/GenerateCustomizer/Template/preview.js
+index 2d9f6e92..9e2d916c 100644
+--- a/Plugins/GenerateCustomizer/Template/preview.js
++++ b/Plugins/GenerateCustomizer/Template/preview.js
+@@ -28,7 +28,7 @@ export function readPreview(buffer, defaultColor) {
+     if (new TextDecoder().decode(new Uint8Array(buffer, 0, 4)) !== "CDVP") throw new Error("The model's preview isn't readable");
+     offset = 4;
+     const version = uint32();
+-    if (version !== 1) throw new Error(`The model's preview has an unknown version, ${version}`);
++    if (version !== 1 && version !== 2) throw new Error(`The model's preview has an unknown version, ${version}`);
+ 
+     const group = new THREE.Group();
+     const partCount = uint32();
+@@ -36,7 +36,11 @@ export function readPreview(buffer, defaultColor) {
+         string(); // id
+         string(); // name
+         const semantic = string();
+-        const positions = array(Float32Array, uint32() * 3);
++        const vertexCount = uint32();
++        if (version >= 2) offset = Math.ceil(offset / 8) * 8;
++        // Edge classification needs the original coordinates, especially on
++        // nearly degenerate boolean/chamfer triangles. GPU buffers are f32 later.
++        const positions = array(version >= 2 ? Float64Array : Float32Array, vertexCount * 3);
+         const triangleCount = uint32();
+         const indices = array(Uint32Array, triangleCount * 3);
+         const materialIndices = array(Int32Array, triangleCount);
+diff --git a/Plugins/GenerateCustomizer/Template/threemf.js b/Plugins/GenerateCustomizer/Template/threemf.js
+index 836b5973..39e37460 100644
+--- a/Plugins/GenerateCustomizer/Template/threemf.js
++++ b/Plugins/GenerateCustomizer/Template/threemf.js
+@@ -89,7 +89,8 @@ export function read3MF(buffer, defaultColor) {
+     // A mesh for each material the object's triangles use, sharing the object's vertices
+     function readMesh(mesh, object, resources, path, semantic) {
+         const vertexNodes = mesh.getElementsByTagNameNS(CORE, "vertex");
+-        const positions = new Float32Array(vertexNodes.length * 3);
++        // Match the native viewer: classify edges before rounding coordinates for WebGL.
++        const positions = new Float64Array(vertexNodes.length * 3);
+         for (let i = 0; i < vertexNodes.length; i++) {
+             positions[i * 3] = Number(vertexNodes[i].getAttribute("x"));
+             positions[i * 3 + 1] = Number(vertexNodes[i].getAttribute("y"));
+diff --git a/Sources/Cadova/Concrete Layer/Output Providers/3MF/ThreeMFDataProvider+CustomizerPreview.swift b/Sources/Cadova/Concrete Layer/Output Providers/3MF/ThreeMFDataProvider+CustomizerPreview.swift
+index 71a36370..732dd7a2 100644
+--- a/Sources/Cadova/Concrete Layer/Output Providers/3MF/ThreeMFDataProvider+CustomizerPreview.swift	
++++ b/Sources/Cadova/Concrete Layer/Output Providers/3MF/ThreeMFDataProvider+CustomizerPreview.swift	
+@@ -4,14 +4,14 @@ extension ThreeMFDataProvider {
+     /// The model's parts in the web customizer's preview format, which its page reads straight into
+     /// typed arrays: the meshes LiveLink sends, without the XML and compression of a 3MF file.
+     ///
+-    /// Everything is little-endian, and every array starts at a multiple of four bytes, so that the
++    /// Everything is little-endian, and arrays start at multiples of four bytes (eight for vertex coordinates), so that the
+     /// page can view it in place:
+     ///
+     /// ```
+-    /// "CDVP", version: u32 (1), part count: u32
++    /// "CDVP", version: u32 (2), part count: u32
+     /// For each part:
+     ///   id, name, semantic: string (u32 byte count, UTF-8, zero-padded to a multiple of four)
+-    ///   vertex count: u32, positions: f32 × 3 × vertex count
++    ///   vertex count: u32, zero padding to 8-byte alignment, positions: f64 × 3 × vertex count
+     ///   triangle count: u32, vertex indices: u32 × 3 × triangle count,
+     ///     material indices: i32 × triangle count (-1 for none)
+     ///   default material index: i32 (-1 for none)
+@@ -21,7 +21,7 @@ extension ThreeMFDataProvider {
+     func customizerPreview(context: EvaluationContext) async throws -> Data? {
+         var writer = PreviewWriter()
+         writer.append(contentsOf: Array("CDVP".utf8))
+-        writer.append(UInt32(1))
++        writer.append(UInt32(2))
+ 
+         let parts = try await meshParts(context: context)
+         writer.append(UInt32(parts.count))
+@@ -31,7 +31,10 @@ extension ThreeMFDataProvider {
+             writer.append(part.part.semantic.rawValue)
+ 
+             writer.append(UInt32(part.vertices.count))
+-            writer.append(part.vertices.flatMap { [Float($0.x), Float($0.y), Float($0.z)] })
++            // Keep the original precision until the browser has classified edges.
++            // Rounding thin triangles to Float first can turn smooth faces into creases.
++            writer.align(to: 8)
++            writer.append(part.vertices.flatMap { [$0.x, $0.y, $0.z] })
+ 
+             writer.append(UInt32(part.triangleMaterialIndices.count))
+             writer.append(part.triangles)
+@@ -70,10 +73,16 @@ private struct PreviewWriter {
+         values.map(\.littleEndian).withUnsafeBytes { bytes.append(contentsOf: $0) }
+     }
+ 
+-    mutating func append(_ values: [Float]) {
++    mutating func append(_ values: [Double]) {
+         append(values.map(\.bitPattern))
+     }
+ 
++    mutating func align(to alignment: Int) {
++        while bytes.count % alignment != 0 {
++            bytes.append(0)
++        }
++    }
++
+     /// A string, zero-padded so that whatever follows it stays aligned to four bytes.
+     mutating func append(_ string: String) {
+         let utf8 = Array(string.utf8)

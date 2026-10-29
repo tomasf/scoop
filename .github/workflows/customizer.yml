@@ -1,0 +1,90 @@
+name: Customizer
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+# Mirrors Cadova's BuildCustomizer action, but builds with tools/build_customizer.sh so the
+# customizer gets the same dependency patch as a local build.
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    # Use the Swift version that the pinned Cadova builds customizers with.
+    - name: Set up
+      run: |
+        revision=$(jq -r '.pins[] | select(.identity == "cadova") | .state.revision' Package.resolved)
+        swift_version=$(curl -fsSL --retry 3 \
+          "https://raw.githubusercontent.com/tomasf/Cadova/$revision/Plugins/GenerateCustomizer/Support/swift-version" \
+          | tr -d '[:space:]')
+        swiftly_home="$RUNNER_TEMP/swiftly"
+        {
+          echo "SWIFT_VERSION=$swift_version"
+          echo "SWIFTLY_HOME=$swiftly_home"
+          echo "CADOVA_WASM_TOOLCHAIN=$swiftly_home/toolchains/$swift_version"
+        } >> "$GITHUB_ENV"
+
+    - name: Restore the toolchain
+      id: toolchain-cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.CADOVA_WASM_TOOLCHAIN }}
+        key: swift-${{ env.SWIFT_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Install Swift ${{ env.SWIFT_VERSION }}
+      if: steps.toolchain-cache.outputs.cache-hit != 'true'
+      env:
+        SWIFTLY_HOME_DIR: ${{ env.SWIFTLY_HOME }}
+        SWIFTLY_BIN_DIR: ${{ env.SWIFTLY_HOME }}/bin
+        SWIFTLY_TOOLCHAINS_DIR: ${{ env.SWIFTLY_HOME }}/toolchains
+      run: |
+        cd "$RUNNER_TEMP"
+        curl -fsSL -o swiftly.tar.gz "https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz"
+        tar xzf swiftly.tar.gz
+        ./swiftly init --assume-yes --quiet-shell-followup --skip-install --no-modify-profile
+        "$SWIFTLY_BIN_DIR/swiftly" install "$SWIFT_VERSION" --assume-yes --post-install-file post-install.sh
+        if [ -s post-install.sh ]; then
+          sudo apt-get update -q
+          sudo bash post-install.sh
+        fi
+        "$CADOVA_WASM_TOOLCHAIN/usr/bin/swift" --version
+
+    # The build script restores the patched checkouts when it exits, so the cache stays clean.
+    - name: Restore the build
+      uses: actions/cache@v4
+      with:
+        path: .build
+        key: build-${{ env.SWIFT_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.resolved', 'patches/**') }}
+        restore-keys: |
+          build-${{ env.SWIFT_VERSION }}-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Build the customizer
+      run: |
+        export PATH="$CADOVA_WASM_TOOLCHAIN/usr/bin:$PATH"
+        ./tools/build_customizer.sh --source-url "${{ github.server_url }}/${{ github.repository }}"
+
+    - uses: actions/upload-pages-artifact@v3
+      with:
+        path: Customizer
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+    - id: deployment
+      uses: actions/deploy-pages@v4
